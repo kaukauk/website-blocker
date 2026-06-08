@@ -1,0 +1,11 @@
+[Unit]
+Description=Social blocker — re-block sites at boot
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/social-blocker init
+
+[Install]
+WantedBy=multi-user.target
