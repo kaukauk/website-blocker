@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Social-site blocker with a 5-minute rolling-hour budget."""
+"""Social-site blocker with a 5-minute rolling-hour budget and self-healing watchdog."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ STATE_DIR = Path("/var/lib/social-blocker")
 USAGE_LOG = STATE_DIR / "usage.log"
 PID_FILE = STATE_DIR / "session.pid"
 SESSION_START_FILE = STATE_DIR / "session.start"
-PAUSE_UNTIL_FILE = STATE_DIR / "pause_until"
 MARK_BEGIN = "# >>> social-blocker >>>"
 MARK_END = "# <<< social-blocker <<<"
 
@@ -67,6 +66,15 @@ def read_hosts_clean() -> str:
 
 def is_blocked() -> bool:
     return MARK_BEGIN in HOSTS.read_text()
+
+
+def is_firewall_applied() -> bool:
+    for binary in ("iptables", "ip6tables"):
+        if _ipt_run(binary, "-C", "OUTPUT", "-j", CHAIN) != 0:
+            return False
+        if _ipt_run(binary, "-C", CHAIN, "-p", "udp", "--dport", "443", "-j", "DROP") != 0:
+            return False
+    return True
 
 
 def write_blocked() -> None:
@@ -188,7 +196,7 @@ def daemon_kill_existing() -> None:
 
 
 def daemon_run(duration: int) -> None:
-    """Run inside the forked daemon: sleep, then block."""
+    """Run inside the forked unblock session: sleep, then block."""
     start = time.time()
     SESSION_START_FILE.write_text(f"{start:.0f}")
     PID_FILE.write_text(str(os.getpid()))
@@ -200,7 +208,6 @@ def daemon_run(duration: int) -> None:
         record_session(start, min(actual_end, end_time))
         SESSION_START_FILE.unlink(missing_ok=True)
         PID_FILE.unlink(missing_ok=True)
-        PAUSE_UNTIL_FILE.unlink(missing_ok=True)
         write_blocked()
         sys.exit(0)
 
@@ -208,7 +215,7 @@ def daemon_run(duration: int) -> None:
     signal.signal(signal.SIGINT, finish)
 
     while time.time() < end_time:
-        time.sleep(min(5, end_time - time.time()))
+        time.sleep(min(2, max(0.2, end_time - time.time())))
     finish()
 
 
@@ -280,54 +287,69 @@ def cmd_unblock(requested_minutes: float | None = None) -> None:
     spawn_daemon(granted)
 
 
-def read_pause_until() -> float | None:
-    if not PAUSE_UNTIL_FILE.exists():
-        return None
-    try:
-        return float(PAUSE_UNTIL_FILE.read_text().strip())
-    except ValueError:
-        return None
-
-
-def cmd_pause(minutes: float) -> None:
-    """Open access for an arbitrary duration, ignoring the hourly budget. Survives reboots."""
-    if minutes <= 0:
-        print("Minutes must be positive.")
-        return
-    if SESSION_START_FILE.exists():
-        print("Session already active. Run 'block' to end it.")
-        return
-    duration = int(minutes * 60)
-    PAUSE_UNTIL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PAUSE_UNTIL_FILE.write_text(f"{time.time() + duration:.0f}")
-    write_unblocked()
-    print(f"Unblocked for {fmt(duration)} (budget bypassed). Survives reboots.")
-    spawn_daemon(duration)
-
-
 def cmd_init() -> None:
-    """Called at boot. Respects an active pause; otherwise blocks."""
-    until = read_pause_until()
-    now = time.time()
-    if until is not None and until > now:
-        remaining = int(until - now)
-        write_unblocked()
-        print(f"Pause active — {fmt(remaining)} remaining.")
-        spawn_daemon(remaining)
-    else:
-        PAUSE_UNTIL_FILE.unlink(missing_ok=True)
-        write_blocked()
-        print("Blocked.")
+    """Enforce block immediately at startup."""
+    write_blocked()
+    print("Blocked.")
 
 
 def cmd_block() -> None:
     daemon_kill_existing()
     # Give the daemon's SIGTERM handler a moment to record + block; then ensure block.
     time.sleep(0.3)
-    PAUSE_UNTIL_FILE.unlink(missing_ok=True)
     write_blocked()
     SESSION_START_FILE.unlink(missing_ok=True)
     print("Blocked.")
+
+
+def cmd_daemon() -> None:
+    """Continuous self-healing watchdog. Runs in background via systemd."""
+    # Ensure any stale pause files from older versions are deleted
+    (STATE_DIR / "pause_until").unlink(missing_ok=True)
+
+    # Initial block check
+    if not (SESSION_START_FILE.exists() and PID_FILE.exists()):
+        write_blocked()
+
+    running = True
+
+    def _sig_handler(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.signal(signal.SIGINT, _sig_handler)
+
+    while running:
+        time.sleep(5)
+        now = time.time()
+        session_active = False
+
+        if SESSION_START_FILE.exists():
+            if PID_FILE.exists():
+                try:
+                    pid = int(PID_FILE.read_text().strip())
+                    os.kill(pid, 0)
+                    session_active = True
+                except (ValueError, ProcessLookupError):
+                    # Unblock process is dead
+                    SESSION_START_FILE.unlink(missing_ok=True)
+                    PID_FILE.unlink(missing_ok=True)
+            else:
+                SESSION_START_FILE.unlink(missing_ok=True)
+
+        if not session_active:
+            # Not in an unblock session — ensure block is intact
+            if not is_blocked() or not is_firewall_applied():
+                write_blocked()
+        else:
+            # In an unblock session — ensure budget limit is strictly enforced
+            try:
+                start = float(SESSION_START_FILE.read_text().strip())
+                if (now - start) > BUDGET_SECONDS or now >= hour_end(start):
+                    cmd_block()
+            except ValueError:
+                cmd_block()
 
 
 def main() -> None:
@@ -349,19 +371,11 @@ def main() -> None:
         cmd_block()
     elif cmd == "init":
         cmd_init()
-    elif cmd == "pause":
-        if len(sys.argv) < 3:
-            print(f"usage: {sys.argv[0]} pause <minutes>", file=sys.stderr)
-            sys.exit(2)
-        try:
-            minutes = float(sys.argv[2])
-        except ValueError:
-            print(f"invalid minutes: {sys.argv[2]}", file=sys.stderr)
-            sys.exit(2)
-        cmd_pause(minutes)
+    elif cmd == "daemon":
+        cmd_daemon()
     else:
         print(
-            f"usage: {sys.argv[0]} {{status|unblock [minutes]|pause <minutes>|block}}",
+            f"usage: {sys.argv[0]} {{status|unblock [minutes]|block}}",
             file=sys.stderr,
         )
         sys.exit(2)

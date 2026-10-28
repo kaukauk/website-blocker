@@ -9,8 +9,9 @@ whole afternoon.
 - **Firewall layer** — `iptables`/`ip6tables` rules that drop UDP/443 (kills
   QUIC) and drop TCP/443 packets whose TLS SNI matches a blocked domain or its
   CDN. This catches traffic that bypasses `/etc/hosts` (apps, hardcoded DNS).
-
-The block is re-applied automatically at every boot via a systemd service.
+- **Self-healing watchdog service** — a persistent background systemd service
+  monitors DNS and firewall rules every 5 seconds, auto-restoring the block if
+  rules or hosts are tampered with.
 
 > **Platform:** Linux with `systemd`, `iptables`/`ip6tables`, and
 > `resolvectl` (systemd-resolved). Requires root (the commands self-`sudo`).
@@ -29,20 +30,12 @@ That script:
 
 1. copies `blocker.py` → `/usr/local/bin/social-blocker`
 2. installs the `sblock` convenience wrapper → `/usr/local/bin/sblock`
-3. installs + enables the boot service (`social-blocker.service`)
+3. installs + enables the persistent watchdog service (`social-blocker.service`)
 4. applies the block immediately
+5. sets up filesystem immutability and AI agent safety guardrails
 
-The installed copies are **independent of this folder** — once installed you
-can move, rename, or delete this repo without breaking anything.
-
-### Updating after you edit `blocker.py`
-
-The system runs the installed *copy*, not the file in this folder. After
-editing, re-run the installer to push your changes:
-
-```bash
-sudo ./install.sh
-```
+The installed service is **completely independent of this folder** — once installed,
+the repository can be removed so the blocker lives entirely as a protected background system service.
 
 ---
 
@@ -54,7 +47,6 @@ Use the `sblock` wrapper from anywhere (it handles `sudo` for you):
 sblock status            # show block state, budget used/remaining, reset time
 sblock unblock           # open sites for ALL remaining budget this hour
 sblock unblock 3         # open for 3 minutes (capped by remaining budget)
-sblock pause 60          # open for 60 min, IGNORING the budget (survives reboot)
 sblock block             # re-block immediately and end any open session
 ```
 
@@ -67,10 +59,8 @@ Equivalent without the wrapper: `sudo social-blocker <command>`.
 - `unblock` opens the sites and starts a background daemon that **auto-blocks**
   again when your granted time runs out (or when the hour ends, whichever is
   first).
-- `pause <minutes>` is the escape hatch: it opens access for an arbitrary
-  duration and **ignores the hourly budget**. It also persists across reboots —
-  if you reboot mid-pause, the boot service honours the remaining pause time
-  instead of re-blocking.
+- The background daemon enforces this limit: if the unblock session ends or exceeds
+  the budget, sites are immediately re-blocked.
 
 ### Example
 
@@ -89,8 +79,6 @@ Unblocked for 2m00s. Will auto-block when time runs out.
 
 ## Configuration
 
-Edit `blocker.py`, then re-run `sudo ./install.sh`.
-
 - **`SITES`** — domains written into `/etc/hosts`.
 - **`SNI_PATTERNS`** — substrings matched in TLS ClientHello (domains + CDNs).
 - **`BUDGET_SECONDS`** — per-hour budget in seconds (default `300` = 5 min).
@@ -103,38 +91,34 @@ Edit `blocker.py`, then re-run `sudo ./install.sh`.
 |------|---------|
 | `/usr/local/bin/social-blocker` | the installed script |
 | `/usr/local/bin/sblock` | wrapper that runs the script via `sudo` |
-| `/etc/systemd/system/social-blocker.service` | re-blocks at boot (`init`) |
+| `/etc/systemd/system/social-blocker.service` | persistent self-healing watchdog daemon |
 | `/etc/hosts` (between `# >>> social-blocker >>>` markers) | DNS block |
-| `iptables` chain `SOCIAL_BLOCKER` | firewall block (rebuilt each `init`) |
-| `/var/lib/social-blocker/` | runtime state (usage log, pid, pause file) |
-
-The `iptables` rules live in kernel memory and are **not** persisted across
-reboots — that's intentional. The boot service re-applies them every time it
-runs `init`, so there's no dependency on an iptables-save mechanism.
+| `iptables` chain `SOCIAL_BLOCKER` | firewall block (re-checked continuously) |
+| `/var/lib/social-blocker/` | runtime state (usage log, session start/pid) |
 
 ### Commands
 
 | Command | What it does |
 |---------|--------------|
-| `init` | Boot entrypoint. Honours an active `pause`, otherwise blocks. |
+| `daemon` | Background watchdog daemon running continuously under systemd. |
 | `status` | Print block state and budget. |
 | `unblock [min]` | Open sites within the hourly budget; auto-block on expiry. |
-| `pause <min>` | Open sites ignoring the budget; survives reboots. |
 | `block` | Re-block now; kill any active session. |
+| `init` | Immediate block enforcer. |
 
 ---
 
-## Uninstall
+## Maintenance & Updates
+
+To modify or update the installed script if immutability (`chattr +i`) is enabled:
 
 ```bash
-sudo social-blocker block                       # ensure sites are blocked/clean state
-sudo systemctl disable --now social-blocker.service
-sudo rm /etc/systemd/system/social-blocker.service
-sudo systemctl daemon-reload
-sudo rm /usr/local/bin/social-blocker /usr/local/bin/sblock
-sudo rm -rf /var/lib/social-blocker
-```
+# Temporarily allow edits:
+sudo chattr -i /usr/local/bin/social-blocker /usr/local/bin/sblock /etc/systemd/system/social-blocker.service
 
-`social-blocker block` rewrites `/etc/hosts` without the managed block and
-flushes the firewall chain, so removing the files afterwards leaves a clean
-system.
+# Make changes / re-run install:
+sudo ./install.sh
+
+# Re-lock:
+sudo chattr +i /usr/local/bin/social-blocker /usr/local/bin/sblock /etc/systemd/system/social-blocker.service
+```
